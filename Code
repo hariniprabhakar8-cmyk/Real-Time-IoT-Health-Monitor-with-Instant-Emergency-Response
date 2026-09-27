@@ -1,0 +1,216 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// DHT11
+#define DHTPIN 14
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// DS18B20
+#define ONE_WIRE_BUS 4
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// Pulse Sensor
+#define PULSE_PIN 34
+int pulseSignal;
+unsigned long lastBeatTime = 0;
+int BPM;
+
+// GPS
+static const int RXPin = 16, TXPin = 17;
+static const uint32_t GPSBaud = 9600;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+
+// Emergency Button
+#define BUTTON_PIN 15
+bool buttonPressed = false;
+
+// WiFi & Twilio
+const char* ssid = "ENTER_YOUR_WIFI_NAME";
+const char* password = "ENTER_YOUR_WIFI_PASSWORD";
+
+String twilioSID = "ENTER_YOUR_TWILIO_ACCOUNT_SID";
+String twilioAuth = "ENTER_YOUR_TWILIO_AUTH_TOKEN";
+String twilioNumber = "ENTER_YOUR_TWILIO_PHONE_NUMBER";
+String targetNumber = "ENTER_EMERGENCY_CONTACT_PHONE_NUMBER";
+
+// Patient Info
+String patientName = "ENTER_PATIENT_NAME";
+String patientAge = "ENTER_PATIENT_AGE";
+String patientGender = "ENTER_PATIENT_GENDER"; // M or F
+String bpStatus = "ENTER_BP_STATUS";
+String sugarStatus = "ENTER_SUGAR_STATUS";
+
+// Setup
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  sensors.begin();
+
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
+
+  pinMode(PULSE_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT); // Use pull-down resistor
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println(" Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.println("Health Monitoring System Started...");
+}
+
+// ---------- Send SMS via Twilio ----------
+void sendSMS(String msg) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    String url =
+        "https://api.twilio.com/2010-04-01/Accounts/"
+        + twilioSID + "/Messages.json";
+
+    String postData =
+        "To=" + targetNumber +
+        "&From=" + twilioNumber +
+        "&Body=" + msg;
+
+    http.begin(url);
+    http.setAuthorization(
+        twilioSID.c_str(), twilioAuth.c_str()
+    );
+
+    http.addHeader(
+        "Content-Type",
+        "application/x-www-form-urlencoded"
+    );
+
+    int httpResponseCode = http.POST(postData);
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("SMS sent: " + msg);
+      Serial.println("Response: " + response);
+    } else {
+      Serial.print("Error sending SMS. HTTP code: ");
+      Serial.println(httpResponseCode);
+      Serial.println("Response: " + http.getString());
+    }
+
+    http.end();
+  }
+}
+
+// Main Loop
+void loop() {
+  // Read Humidity and Room Temp
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  // Read Body Temp
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+
+  // Read Pulse Sensor
+  pulseSignal = analogRead(PULSE_PIN);
+  detectPulse(pulseSignal);
+
+  // Read GPS Location
+  String location = "Loc:N/A";
+
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read())) {
+      if (gps.location.isUpdated()) {
+        location =
+            "Lat:" + String(gps.location.lat(), 6) +
+            ",Lng:" + String(gps.location.lng(), 6);
+      }
+    }
+  }
+
+  // Check Emergency Button
+  if (digitalRead(BUTTON_PIN) == HIGH) {
+    if (!buttonPressed) {
+      buttonPressed = true;
+
+      // Construct compact SMS
+      String alert =
+          "P:" + patientName + "(" +
+          patientAge + patientGender + ") " +
+          "HR:" + String(BPM) +
+          " RT:" + String(t, 1) + "C" +
+          " H:" + String(h, 0) + "%" +
+          " BT:" + String(tempC, 1) + "C" +
+          " BP:" + bpStatus +
+          " Sug:" + sugarStatus +
+          " " + location;
+
+      sendSMS(alert);
+    }
+  } else {
+    buttonPressed = false;
+  }
+
+  // Debug Output
+  Serial.print("Humidity: ");
+  Serial.print(h);
+  Serial.println(" %");
+
+  Serial.print("Room Temp: ");
+  Serial.print(t);
+  Serial.println(" C");
+
+  Serial.print("Body Temp: ");
+  Serial.print(tempC);
+  Serial.println(" C");
+
+  Serial.print("Pulse BPM: ");
+  Serial.println(BPM);
+
+  Serial.print("BP Status: ");
+  Serial.println(bpStatus);
+
+  Serial.print("Sugar Status: ");
+  Serial.println(sugarStatus);
+
+  Serial.print("Location: ");
+  Serial.println(location);
+
+  Serial.println("-----------------------------");
+  delay(2000);
+}
+
+// Pulse Detection
+void detectPulse(int signal) {
+  static int threshold = 512;
+  static bool pulseDetected = false;
+
+  if (signal > threshold && !pulseDetected) {
+    pulseDetected = true;
+
+    unsigned long currentTime = millis();
+    unsigned long diff = currentTime - lastBeatTime;
+
+    if (diff > 300) { // Minimum time between beats
+      BPM = 60000 / diff;
+      lastBeatTime = currentTime;
+    }
+  }
+
+  if (signal < threshold) {
+    pulseDetected = false;
+  }
+}
